@@ -890,6 +890,86 @@ class PromptProgressStream(unittest.TestCase):
         self.assertIn("usage", out)
 
 
+class StreamStartsAtTheFirstToken(unittest.TestCase):
+    """A streamed chat completion's first data chunk is the first token's, not an empty role chunk sent as soon as the
+    request arrived.  A client timing its Time To First Response from that chunk read the prompt processing as the
+    time between the request and the queue (llama-benchy reported 166,158 tok/s for a 2048-token prompt that the
+    engine read at 227 tok/s: TTFR 15 ms, the end-to-end time 7.7 s).  The role still comes exactly once, with that
+    first chunk - a client that reads `delta.role` before any text keeps working."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.prefill = 0.25                          # the prompt read this test pretends the engine needs
+
+    def engine(self):
+        class SlowPrefill(MockEngine):
+            def generate(inner, ids, max_new, sampling, cancel, embeddings=None):
+                for _ in range(5):                   # the prompt's chunks: heartbeats, as a real engine sends while it reads
+                    time.sleep(self.prefill / 5)
+                    yield None
+                yield from MockEngine.generate(inner, ids, max_new, sampling, cancel, embeddings)
+
+        return SlowPrefill(self.tok, ANSWER, max_context=CTX)
+
+    def read(self):
+        svc = Service(self.engine(), self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        body = {"model": "m", "stream": True, "max_tokens": 2200, "messages": [{"role": "user", "content": "hi"}]}
+        started = time.perf_counter()
+        first_data = None
+        chunks = []
+        try:
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                        headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                for raw in r:                        # line by line, as a client does (a read per chunk, not at the end)
+                    line = raw.decode()
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        continue
+                    chunk = json.loads(line[len("data: "):])
+                    if first_data is None:
+                        first_data = time.perf_counter() - started
+                    chunks.append(chunk)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        return first_data, chunks
+
+    def test_the_first_chunk_waits_for_the_first_token(self):
+        first_data, chunks = self.read()
+        self.assertGreaterEqual(first_data, self.prefill, "a data chunk arrived before the prompt was read")
+        delta = chunks[0]["choices"][0]["delta"]
+        self.assertEqual(delta.get("role"), "assistant", delta)
+        self.assertTrue(any(k in delta for k in ("content", "reasoning_content", "tool_calls")), delta)
+
+    def test_the_role_comes_once(self):
+        _, chunks = self.read()
+        roles = [c["choices"][0]["delta"].get("role") for c in chunks[:-1]]
+        self.assertEqual(roles.count("assistant"), 1, roles)
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertIn("usage", chunks[-1])
+
+    def test_an_answer_with_no_tokens_still_opens_with_the_role(self):
+        svc = Service(MockEngine(self.tok, "", max_context=CTX), self.tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        body = {"model": "m", "stream": True, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+        try:
+            req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                        headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                text = r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        chunks = [json.loads(ln[len("data: "):]) for ln in text.splitlines()
+                  if ln.startswith("data: ") and ln.strip() != "data: [DONE]"]
+        self.assertEqual([c["choices"][0]["delta"].get("role") for c in chunks], ["assistant"])
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+
+
 class LiveRateBursts(unittest.TestCase):
     """With drafting the tokens come in bursts (a step's accepted drafts at once, 1 to 4 of them): the live rate must
     cover its whole RATE_WINDOW_S, not the last few bursts, or it swings far around the true rate (a CLI dashboard

@@ -43,7 +43,8 @@ def reader():
                 if len(active) >= n:
                     out(f"ERR {rid} all {n} conversation states are busy")
                     continue
-                active[rid] = {"left": [i + 1000 for i in ids][: int(f[1])], "n": 0}
+                # (its prompt's length is in its DONE line too: a request's own figure, for the per-request timings)
+                active[rid] = {"left": [i + 1000 for i in ids][: int(f[1])], "n": 0, "prompt": len(ids)}
             out(f"PP {rid} {len(ids)} {len(ids)} 1.0 1000.0")
     quit_.set()
 
@@ -65,7 +66,8 @@ while not quit_.is_set():
             stopped = rid in stops
             stops.discard(rid)
             if stopped or not r["left"]:
-                out(f"DONE {rid} {r['n']} 1 0.0 1.0 {'cancel' if stopped else 'length'} 0 0 0")
+                out(f"DONE {rid} {r['n']} {r['prompt']} {float(r['prompt'])} 1.0 "
+                    f"{'cancel' if stopped else 'length'} 0 0 0")
                 del active[rid]
                 continue
             t = r["left"].pop(0)

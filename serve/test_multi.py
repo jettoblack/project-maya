@@ -42,6 +42,38 @@ class Engine(unittest.TestCase):
             self.assertEqual(toks, [i + 1000 for i in ids], k)
         self.assertEqual(len(out), 3)
 
+    def test_a_request_reads_only_its_own_figures(self):
+        """--parallel: each request's timings, Monitor history row and /v1/status come from ITS DONE line.
+
+        They used to read engine.last, which every concurrent request overwrote (and which held the PREVIOUS
+        request's line while a request was still running): a 5-token prompt could get a 200-token prompt's prompt_ms
+        and report its prompt processing speed.  last_request() keeps them per thread, keyed by the request's rid."""
+        a = list(range(200))
+        gen = self.engine.generate(a, 200, {}, threading.Event())
+        got = []
+        for _ in range(5):                            # A is running: its DONE has not arrived
+            t = next(gen)
+            if t is not None:
+                got.append(t)
+        self.assertIsNone(self.engine.last_request())     # ... so it has no figures yet (not B's, not an old one's)
+        out = {}
+
+        def other():
+            ids = list(range(1000, 1005))
+            out["toks"] = len([t for t in self.engine.generate(ids, 5, {}, threading.Event()) if t is not None])
+            out["last"] = dict(self.engine.last_request())
+
+        th = threading.Thread(target=other)
+        th.start()
+        th.join(30)
+        self.assertEqual(out["toks"], 5)
+        self.assertEqual(out["last"]["prompt_tokens"], 5)     # B's own: the prompt it sent
+        for _ in gen:
+            pass
+        mine = self.engine.last_request()
+        self.assertEqual(mine["prompt_tokens"], len(a))        # A's own, after its DONE
+        self.assertEqual(mine["generated"], len(a))            # (the fake engine answers one token per prompt token)
+
     def test_a_consumer_that_stops_ends_only_its_request(self):
         out = {}
 

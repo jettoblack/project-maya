@@ -582,6 +582,41 @@ class StrataEngine:
     def alive(self) -> bool:
         return not getattr(self, "ended", False) and self.proc.poll() is None
 
+    def last_request(self) -> dict | None:
+        """The DONE figures of the request on THIS thread (`generated`, `prompt_ms`, `decode_ms`, `reused`, ...).
+        On an engine that runs several conversations at once, `self.last` is whichever request finished last, so a
+        request reading it for its own timings, its history row or /v1/status recorded another request's speeds (a
+        `--parallel` bug: a 2048-token prompt got a 48,000-token prompt's prompt_ms).   Each request's figures are
+        its own rid's DONE line now; None while it has none (so an error or a cancel cannot take another's).  A fresh
+        dict per DONE: `is` says whether this request's arrived."""
+        if not self.multi:
+            return self.last
+        tls = getattr(self, "_tls", None)
+        return getattr(tls, "last", None) if tls is not None else None
+
+    def set_last_request(self, figures: dict):
+        """The figures this thread's request is accounted with (the fair slices sum their segments into one)."""
+        if self.multi:
+            self._tls.last = figures
+        else:
+            self.last = figures
+
+    def request_progress(self):
+        """(read, total, reuse, ms) of the prompt THIS thread's request is reading: under `--parallel` its own PP lines,
+        not whichever request printed one last (a request's prompt_progress chunk and its "reading the prompt" line
+        showed another conversation's tokens)."""
+        if self.multi:
+            tls = getattr(self, "_tls", None)
+            return getattr(tls, "progress", None) if tls is not None else None
+        return self.progress
+
+    def request_prefill_mean(self):
+        """The engine's mean tok/s over the tokens it read for THIS thread's request (None when it reports none)."""
+        if self.multi:
+            tls = getattr(self, "_tls", None)
+            return getattr(tls, "prefill_tok_s_mean", None) if tls is not None else None
+        return getattr(self, "prefill_tok_s_mean", None)
+
     def _activity(self):
         """(CPU seconds, disk bytes read + written) the engine process has used so far; None without psutil."""
         try:
@@ -891,8 +926,11 @@ class StrataEngine:
         with self._routes_lock:
             self._routes[rid] = q
         self._tls.rid = rid
+        self._tls.last = None                           # this request's DONE figures (last_request): not another's
         self.progress = None
+        self._tls.progress = None
         self.prefill_tok_s_mean = None
+        self._tls.prefill_tok_s_mean = None
         keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
@@ -929,15 +967,19 @@ class StrataEngine:
                     yield int(f[2])
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]),
-                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
-                                         float(f[4]) if len(f) >= 5 else 0.0)
-                        self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
+                        pr = (int(f[2]), int(f[3]),
+                              int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                              float(f[4]) if len(f) >= 5 else 0.0)
+                        rate = float(f[5]) if len(f) >= 6 else None
+                        # the request's own figures and its place in the Monitor: concurrent requests do not share them
+                        self.progress, self._tls.progress = pr, pr
+                        self.prefill_tok_s_mean = self._tls.prefill_tok_s_mean = rate
                     if cancel.is_set():
                         return
                     yield None
                 elif line.startswith("DONE "):
                     self._parse_done("DONE " + line.split(None, 2)[2])
+                    self._tls.last = dict(self.last)           # this request's figures (last_request), not a later one's
                     done = True
                     return
                 elif line.startswith("ERR "):
@@ -956,10 +998,12 @@ class StrataEngine:
                         break
                     if line.startswith("DONE "):
                         self._parse_done("DONE " + line.split(None, 2)[2])
+                        self._tls.last = dict(self.last)
                         break
             with self._routes_lock:
                 self._routes.pop(rid, None)
             self._tls.rid = None
+            self._tls.progress = self._tls.prefill_tok_s_mean = None
 
     def pause(self, keep: bool = False):
         """End the request in flight at its next step and keep the conversation's state with what it wrote (the
@@ -1701,7 +1745,7 @@ class Service:
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
             reading = self.status.get("busy") and self.status.get("first_token") is None
-        return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+        return self._engine_prefill_mean() if reading else 0.0
 
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
@@ -1999,6 +2043,31 @@ class Service:
                     s["phase"] = "tool call complete"
                 s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
 
+
+    def _engine_progress(self):
+        """The prompt progress of the request on THIS thread: under `--parallel` a request's prompt_progress chunk and
+        its "reading the prompt" line take its own PP lines, not whichever request printed one last."""
+        fn = getattr(self.engine, "request_progress", None)
+        return fn() if fn else getattr(self.engine, "progress", None)
+
+    def _engine_prefill_mean(self):
+        """The engine's mean tok/s over the tokens it read for this thread's request (None when it reports none)."""
+        fn = getattr(self.engine, "request_prefill_mean", None)
+        return fn() if fn else getattr(self.engine, "prefill_tok_s_mean", None)
+
+    def _engine_last(self):
+        """The DONE figures of the request on THIS thread (the engine's `last` where it keeps only one)."""
+        fn = getattr(self.engine, "last_request", None)
+        return fn() if fn else getattr(self.engine, "last", None)
+
+    def _set_engine_last(self, figures: dict):
+        """Account this thread's request with `figures` (the fair slices sum their segments into one)."""
+        fn = getattr(self.engine, "set_last_request", None)
+        if fn:
+            fn(figures)
+        else:
+            self.engine.last = figures
+
     def _progress(self, last_print, every=1.0):
         """A progress line in the server window every `every` seconds while a request runs."""
         now = time.time()
@@ -2008,7 +2077,7 @@ class Service:
             s = dict(self.status)
         el = now - s.get("started", now)
         if s.get("first_token") is None:
-            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
+            pr = self._engine_progress()   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
             print(f"[maya] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
@@ -2051,7 +2120,7 @@ class Service:
         produced, cur, left, smp = [], list(ids), max_new, sampling
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         while True:
-            last0 = getattr(self.engine, "last", None)
+            last0 = self._engine_last()
             gen = self.engine.generate(cur, left, smp, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, left, smp, cancel)
             slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
@@ -2074,11 +2143,11 @@ class Service:
                             cut = True
                             break
                 if pausing:
-                    done = getattr(self.engine, "last", None)
+                    done = self._engine_last()
                     cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
             finally:
                 gen.close()                             # STOP + drain to this slice's DONE, still holding the FIFO
-                fresh = getattr(self.engine, "last", None)
+                fresh = self._engine_last()
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
             if not cut:
@@ -2133,7 +2202,7 @@ class Service:
             for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
                 if all(k in sg for sg in segments):
                     merged[k] = sum(sg[k] for sg in segments)
-            self.engine.last = merged
+            self._set_engine_last(merged)                 # this request's figures (multi: this thread)
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
@@ -2158,9 +2227,10 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
-        # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
-        # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
-        engine_last0 = getattr(self.engine, "last", None)
+        # Identity token: only a DONE line replaces this request's figures, so a request that died, errored or was
+        # disconnected must not have the PREVIOUS request's decode figures recorded as its own (under --parallel it
+        # would otherwise take a concurrent request's: last_request() keeps them per thread).
+        engine_last0 = self._engine_last()
         counted, my_started, my_first = False, time.time(), None
         with self.status_lock:
             self.status["queued"] += 1
@@ -2185,7 +2255,7 @@ class Service:
                     my_started = self.status["started"]
                     self.last_request_at = time.time()
                     self.rate.clear()               # the previous request's samples must not leak into this one
-                before = getattr(self.engine, "last", None)
+                before = self._engine_last()
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
@@ -2225,7 +2295,7 @@ class Service:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
                             last_print = self._progress(last_print)
-                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            pr = self._engine_progress()   # (read, total, reuse, ms), the PP parse
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
@@ -2308,9 +2378,9 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
                 if counted:
+                    mine = self._engine_last()
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
+                    last = {} if mine is None or mine is engine_last0 else dict(mine)
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -2334,7 +2404,7 @@ class Service:
                     t["output_tokens"] += n
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
-                    fresh = getattr(self.engine, "last", None)
+                    fresh = self._engine_last()
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
@@ -2522,7 +2592,20 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": svc.model,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
-    yield chunk({"role": "assistant", "content": ""})
+    # The role chunk goes WITH the first delta that carries something, not ahead of the prompt read: sent alone at
+    # once (as it was), the stream's first data chunk arrived a moment after the request and before the engine had
+    # read the prompt, and a client timing "time to first response" from it read a prompt processing speed of
+    # 166,000 tok/s (llama-benchy, a 2048-token prompt: TTFR 15 ms against a real 7.7 s prompt read).  Held until the
+    # answer's first token, TTFR is the prompt read, as on llama.cpp (whose stream opens with the first token's
+    # chunk).  `sent`: a one-item box the nested answer() writes.
+    sent = [False]
+
+    def answer(delta):
+        """A chunk with answer content: the first one carries the role, as the client expects to see it once."""
+        if sent[0]:
+            return chunk(delta)
+        sent[0] = True
+        return chunk({"role": "assistant", **delta})
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
     # response_format json_object / json_schema: the answer is held and its JSON sent alone at the end (Strata #762)
@@ -2546,28 +2629,29 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
+                yield answer({"reasoning_content": ev.text})
             elif ev.kind == "content" and ev.text:
                 if json_mode:
                     held.append(ev.text)
                     continue
-                yield chunk({"content": ev.text})
+                yield answer({"content": ev.text})
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], **ev.call.to_openai(arguments="")}]})
+                yield answer({"tool_calls": [{"index": streamed[ev.call.id], **ev.call.to_openai(arguments="")}]})
             elif ev.kind == "tool_args":
-                yield chunk({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
+                yield answer({"tool_calls": [{"index": streamed[ev.call.id], "function": {"arguments": ev.text}}]})
             elif ev.kind == "tool_call" and ev.call.id in streamed:
                 continue
             elif ev.kind == "tool_call":
-                yield chunk({"tool_calls": [{"index": calls, **ev.call.to_openai()}]})
+                yield answer({"tool_calls": [{"index": calls, **ev.call.to_openai()}]})
                 calls += 1
         else:
             if held:
-                yield chunk({"content": json_from_text("".join(held))})
+                yield answer({"content": json_from_text("".join(held))})
             finish = "tool_calls" if calls and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
-            last = chunk({}, finish)
+            # an answer that sent nothing (an empty one, a cancel before its first token) still opens with the role
+            last = chunk({}, finish) if sent[0] else chunk({"role": "assistant"}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": x["completion_tokens"],
                              "total_tokens": pt + x["completion_tokens"],
@@ -3460,6 +3544,11 @@ def make_handler(svc: Service):
                 self._stream_job(job, 0)
                 return
             self._sse()
+            # A first byte at once, and only an SSE comment: the answer's role chunk waits for its first token now (a
+            # data chunk before the prompt was read made a client's TTFR - its prompt processing speed - nonsense),
+            # but a client that has already gone is still noticed before the prompt read rather than after it.
+            self.wfile.write(b": keep-alive\n\n")
+            self.wfile.flush()
             try:
                 for c in chunks:
                     if c is None:
