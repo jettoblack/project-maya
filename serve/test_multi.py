@@ -44,6 +44,23 @@ class Engine(unittest.TestCase):
             self.assertEqual(toks, [i + 1000 for i in ids], k)
         self.assertEqual(len(out), 3)
 
+    def test_each_request_reads_its_own_done_figures(self):   # (#310: one shared `last` mixed them up)
+        out = {}
+
+        def one(k):
+            ids = list(range(k * 100, k * 100 + 20 + 7 * k))
+            for _ in self.engine.generate(ids, 20, {}, threading.Event()):
+                pass
+            time.sleep(0.2)                            # (the others' DONE lines land meanwhile)
+            out[k] = (len(ids), self.engine.last.get("prompt_tokens"))
+
+        ths = [threading.Thread(target=one, args=(k,)) for k in range(3)]
+        [t.start() for t in ths]
+        [t.join(30) for t in ths]
+        self.assertEqual(len(out), 3)
+        for k, (n, got) in out.items():
+            self.assertEqual(got, n, k)
+
     def test_a_restart_does_not_hand_out_a_number_a_request_already_has(self):
         """restart() rebuilt the rid counter (from 1) and the routing table while the old engine's requests were still
         unwinding: a request that came in then took an old rid, the engine's lines for it went into THAT request's
@@ -90,6 +107,86 @@ class Engine(unittest.TestCase):
         self.assertIn("busy", str(cm.exception))
         for g in gens:
             g.close()
+
+
+class Interleaved(unittest.TestCase):
+    """STRATA_GLM_PREFILL_INTERLEAVE's lines: a new prompt's PP lines come between the running requests' T lines."""
+
+    def setUp(self):
+        import os
+        os.environ["FAKE_MULTI_INTERLEAVE"] = "20"
+        try:
+            self.engine = StrataEngine(str(ROOT / "serve/fake_multi_engine.py"), ["3"])
+        finally:
+            del os.environ["FAKE_MULTI_INTERLEAVE"]
+
+    def tearDown(self):
+        self.engine.close()
+
+    def test_running_requests_decode_while_a_prompt_is_read(self):
+        times, out = [], {}
+
+        def long_one():
+            ids = list(range(500, 700))
+            toks = []
+            for t in self.engine.generate(ids, 200, {}, threading.Event()):
+                if t is not None:
+                    toks.append(t)
+                    times.append(time.monotonic())
+            out["long"] = toks
+
+        th = threading.Thread(target=long_one)
+        th.start()
+        while len(times) < 3:
+            time.sleep(0.001)
+        sent = time.monotonic()
+        first = None
+        got = []
+        for t in self.engine.generate(list(range(300)), 5, {}, threading.Event()):   # 15 pieces of 20
+            if t is not None:
+                first = first or time.monotonic()
+                got.append(t)
+        th.join(30)
+        self.assertEqual(got, [1000, 1001, 1002, 1003, 1004])
+        self.assertEqual(out["long"], [i + 1000 for i in range(500, 700)])
+        during = [x for x in times if sent < x < first]
+        self.assertGreaterEqual(len(during), 10)      # a token of the running one between the pieces
+        self.assertEqual(self.engine._routes, {})
+
+    def test_a_stop_during_its_read_ends_that_request_alone(self):
+        out = {}
+
+        def long_one():
+            out["long"] = [t for t in self.engine.generate(list(range(500, 600)), 100, {}, threading.Event())
+                           if t is not None]
+
+        th = threading.Thread(target=long_one)
+        th.start()
+        time.sleep(0.05)
+        gen = self.engine.generate(list(range(2000)), 5, {}, threading.Event())     # 100 pieces
+        for _ in range(3):
+            next(gen)                                 # its GEN line is out, its read has begun
+        gen.close()                                   # STOP <rid> mid-read: drained to its DONE
+        self.assertEqual(self.engine.last.get("finish"), "cancel")
+        self.assertEqual(self.engine.last.get("generated", 0), 0)
+        th.join(30)
+        self.assertEqual(out["long"], [i + 1000 for i in range(500, 600)])
+        self.assertEqual(self.engine._routes, {})
+
+    def test_prompts_arriving_during_a_read_queue_behind_it(self):
+        out = {}
+
+        def one(k, n_ids):
+            ids = list(range(k * 1000, k * 1000 + n_ids))
+            out[k] = [t for t in self.engine.generate(ids, 4, {}, threading.Event()) if t is not None]
+
+        ths = [threading.Thread(target=one, args=(k, 200 if k == 0 else 40)) for k in range(3)]
+        for t in ths:
+            t.start()
+            time.sleep(0.005)
+        [t.join(30) for t in ths]
+        for k in range(3):
+            self.assertEqual(out[k], [k * 1000 + 1000 + i for i in range(4)], k)
 
 
 class Places(unittest.TestCase):

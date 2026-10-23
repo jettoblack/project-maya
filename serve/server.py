@@ -59,7 +59,7 @@ from serve.responses import (ResponseStore, input_items, input_page, normalize_r
 from serve.response_config import ENV_KEYS as RESPONSE_ENV_KEYS, limits_from_env  # noqa: E402
 from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
 from serve.response_store import StoreBusy  # noqa: E402
-from serve.update import Updater  # noqa: E402
+from serve.update import RESTART_EXIT, Updater  # noqa: E402
 import maya_names  # noqa: E402  (tools/) the settings' names users see (MAYA_*) and the older ones the code reads
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
@@ -87,6 +87,22 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
             return
         time.sleep(0.5)
     print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s; starting anyway", flush=True)
+
+
+def nvml_pids(pid: int | None, listed: set) -> set:
+    """The pids NVML may list a process the server started under (the GPU map): its own - or, when NVML lists
+    processes but not that one, also those of every process it started in turn: an engine run through a launcher (a
+    script that does not exec it, `nsys launch`, a debugger) holds its GPU memory in a child of the process the server
+    started.  psutil finds them (setup installs it); without it, the pid alone."""
+    if pid is None:
+        return set()
+    if pid in listed or not listed:
+        return {pid}
+    try:
+        import psutil
+        return {pid} | {c.pid for c in psutil.Process(pid).children(recursive=True)}
+    except Exception:  # noqa: BLE001 - no psutil, or the process has just ended: the pid alone
+        return {pid}
 
 
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
@@ -711,10 +727,39 @@ class StrataEngine:
         # request starts any more, the queue filling with requests nothing ever takes: the engine restart was the
         # trigger, the silent wait the bug).
         rids, routes, routes_lock = self._rids, self._routes, self._routes_lock
+        ctx = self.max_context
         self.ended = False
-        self.__init__(*self.spawn)
+        try:
+            self.__init__(*self.spawn)
+        except Exception:
+            # (#351: a start that fails - a GPU that fell off the bus - left max_context 0, so every later request
+            #  failed its size check with "exceeds the context (0)" before ensure_engine could try again; the context
+            #  stays what it was, the next request starts it again or says why it cannot)
+            self.max_context = ctx
+            self.info = {**info, **self.info}
+            self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
+            raise
         self._rids, self._routes, self._routes_lock = rids, routes, routes_lock
         self.info = {**info, **self.info}
+
+    @property
+    def last(self) -> dict:
+        """The last DONE's figures.  With several conversations at once (multi), the figures of the request this thread
+        runs (#310): requests decoded together finish within a step of each other, and one shared field let a request
+        report another's timings and cached tokens.  Each request thread has its own (an empty one until its DONE)."""
+        if self.multi:
+            t = self._tls
+            if not hasattr(t, "last"):
+                t.last = {}
+            return t.last
+        return self._last
+
+    @last.setter
+    def last(self, v: dict):
+        if self.multi:
+            self._tls.last = v
+        else:
+            self._last = v
 
     def _parse_done(self, line):
         f = line.split()
@@ -1725,6 +1770,68 @@ class Service:
         except (OSError, ValueError) as e:
             print(f"[maya] could not save the new context in {self.config_path}: {e}", flush=True)
 
+    def port_info(self) -> dict:
+        """The dashboard's Port: where the server listens, and whether a new port can apply at once (maya.py started
+        this server and starts it again on the saved port) or only from the next start."""
+        host, port = getattr(self, "listen", None) or ("127.0.0.1", None)
+        return {"port": port, "host": host, "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
+                "saved": bool(self.config_path), "restarting": getattr(self, "port_restart", None)}
+
+    def set_port(self, n: int) -> dict:
+        """The dashboard's Port: n saved into the run config (and Maya's start scripts for it), then - when maya.py
+        started this server - the server ends with RESTART_EXIT after the request in flight, and maya.py starts it again
+        on n.  The port must be free on this server's address now (a busy one: an error, nothing saved)."""
+        host, port = getattr(self, "listen", None) or ("127.0.0.1", None)
+        if not 1024 <= n <= 65535:
+            raise ValueError("the port must be a number from 1024 to 65535")
+        if n == port:
+            raise ValueError(f"Maya listens on {n} already")
+        if not self.config_path:
+            raise ValueError("this server runs without a config, so a port cannot be saved: start it with --port")
+        if getattr(self, "port_restart", None):
+            raise ValueError("Maya is already moving to another port")
+        import socket
+        try:
+            with socket.socket(socket.AF_INET6 if ":" in host else socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind((host, n))
+        except OSError as e:
+            raise ValueError(f"port {n} is in use or not allowed here ({e.strerror or e})") from None
+        self._save_port(n)
+        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self.port_restart = n
+            threading.Thread(target=self._restart_on_port, args=(n,), daemon=True).start()
+        print(f"[maya] the port {n} is saved" + (": Maya starts again on it" if restarts else
+              " - it applies from the next start"), flush=True)
+        return {"port": n, "restarts": restarts}
+
+    def _restart_on_port(self, n: int):
+        time.sleep(0.5)                                  # (the answer to the page goes out first)
+        with self.fifo:                                  # the request in flight finishes first
+            print(f"[maya] starting again on port {n} ...", flush=True)
+            self.close_for_restart()
+            os._exit(RESTART_EXIT)
+
+    def _save_port(self, n: int):
+        """"port" in the run config, and --port in Maya's start scripts beside it that start this config (setup writes
+        run-maya-<model>.bat / .sh with the port then chosen; a script would otherwise move it back)."""
+        p = Path(self.config_path)
+        cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+        cfg["port"] = int(n)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+        for script in list(p.parent.glob("run-*.bat")) + list(p.parent.glob("run-*.sh")):
+            try:
+                raw = script.read_bytes()                # (bytes: a .bat keeps its CR LF line ends)
+                if p.name.encode() not in raw:
+                    continue
+                new = re.sub(rb"(--port\s+)\d+", lambda m: m.group(1) + str(int(n)).encode(), raw)
+                if new != raw:
+                    script.write_bytes(new)
+            except OSError as e:
+                print(f"[maya] could not change the port in {script.name}: {e}", flush=True)
+
     def storage(self) -> dict | None:
         """The model's folder and the free space on its drive (About)."""
         if not self.model_dir:
@@ -1913,8 +2020,9 @@ class Service:
         v = self.vision
         vproc = getattr(v, "proc", None) if v is not None else None
         lent = v is not None and getattr(v, "lend", None) is not None and (vproc is not None or getattr(v, "owed", False))
-        return gpu_map.view(report, cards, proc.pid if proc is not None else None,
-                            vproc.pid if vproc is not None else None, lent)
+        listed = {pid for c in cards or [] for pid in c.get("procs") or {}}
+        return gpu_map.view(report, cards, nvml_pids(proc.pid if proc is not None else None, listed),
+                            nvml_pids(vproc.pid if vproc is not None else None, listed), lent)
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
@@ -2751,6 +2859,34 @@ def carry_embeddings(local, path, chunks):
     yield from chunks
 
 
+def watch_client(handler, cancel: threading.Event, every: float = 0.5) -> None:
+    """A request's client watched on its own thread (#314): an API request writes nothing while it waits in the queue,
+    and a non-streamed one nothing until its answer is done, so a client that timed out or went away was only noticed
+    at its first write - queued requests nobody waited for any more piled up for hours, and each then ran its whole
+    answer.  A connection the client closed (or reset) reads as end-of-file: `cancel` is set, the request leaves the
+    queue (or its engine work stops).  Data the client sent meanwhile (its next request on a kept-alive connection) is
+    not an end.  The watch ends with the request's cancel, the connection, or the next request on that connection
+    (one watch a connection)."""
+    import select
+    import socket
+    conn, token = handler.connection, object()
+    handler._client_watch = token
+
+    def watch():
+        while not cancel.wait(every) and getattr(handler, "_client_watch", None) is token:
+            try:
+                ready, _, _ = select.select([conn], [], [], 0)
+                if ready and conn.recv(1, socket.MSG_PEEK) == b"":
+                    cancel.set()
+                    return
+            except ConnectionError:                     # (reset by the client: gone)
+                cancel.set()
+                return
+            except (OSError, ValueError):               # (closed by this server: the request is done)
+                return
+    threading.Thread(target=watch, name="client-watch", daemon=True).start()
+
+
 class StreamJob:
     """A web-app answer that outlives its connection (the request's `strata_resume`): a thread runs its chunks into
     `items` and any reader streams them from an index (GET /v1/strata/stream?id=&from=), so a phone whose screen
@@ -3301,6 +3437,10 @@ def make_handler(svc: Service):
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
                     self._json(200, svc.context_limits())
+            elif path == "/api/port":
+                # the dashboard's Port: where the server listens, and whether a new one applies at once
+                if self._authorized():
+                    self._json(200, svc.port_info())
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself
@@ -3375,6 +3515,9 @@ def make_handler(svc: Service):
                     return
                 if path == "/api/context":
                     self._context()
+                    return
+                if path == "/api/port":
+                    self._port()
                     return
                 if path == "/api/update":
                     self._update()
@@ -3472,6 +3615,20 @@ def make_handler(svc: Service):
                 return
             self._json(202, {"reload": reload})
 
+        def _port(self):
+            # It moves the server for every client, so only the app's own page may ask for it
+            body = self._body()
+            if not self._own_page("the port can be changed"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                n = int(req.get("port")) if isinstance(req, dict) else 0
+                out = svc.set_port(n)
+            except (TypeError, ValueError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            self._json(202, out)
+
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page
             self._body()
@@ -3540,6 +3697,7 @@ def make_handler(svc: Service):
                     return self._background_stream(owner, out["id"])
                 return self._json(200, out)
             cancel = threading.Event()
+            watch_client(self, cancel)
             events = self._response_work(req, sampling, history, validation, owner, cancel)
             try:
                 if not req.get("stream"):
@@ -3610,6 +3768,8 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
+            if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
+                watch_client(self, cancel)
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
@@ -3701,6 +3861,7 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
+            watch_client(self, cancel)
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
@@ -3750,7 +3911,8 @@ class Server(ThreadingHTTPServer):
 
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
-             "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
+              "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
+              "STRATA_SERVER_LOG") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
@@ -3809,6 +3971,7 @@ def lan_addresses() -> list[str]:
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
+    svc.listen = (host, httpd.server_address[1])         # (the dashboard's Port setting starts from it)
     httpd.response_service = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
@@ -4172,8 +4335,11 @@ def main() -> int:
         except ValueError as e:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
         svc.default_effort = cfg["reasoning_effort"]
-        print(f"[maya] thinking level when a request names none: {effort_level(svc.default_effort) or 'none'}"
-              f"{'' if effort_level(svc.default_effort) == svc.default_effort else f' (the config says {svc.default_effort})'}",
+        # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
+        level = effort_level(svc.default_effort) or (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
+                                                     else "none")
+        print(f"[maya] thinking level when a request names none: {level}"
+              f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0) if svc.think_end_id is not None else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))

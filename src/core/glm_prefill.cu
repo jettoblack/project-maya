@@ -18,6 +18,9 @@
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
 
+#include "strata/core/exl3_mma_rows.hpp"
+#include "strata/core/prefill_chunks.hpp"
+#include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
@@ -96,6 +99,9 @@ struct Carve {
 
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
 constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
+// the loan (past a layout's need) the MMQ kernels' stream-k fixup buffers get: see prefill_lend and the pool's
+// size classes (src/prefill/ggml_cuda_host.cu) for why 16 MB bounds every product a chunk launches, at any chunk size
+constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
@@ -366,7 +372,9 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
 }
 
 void blas_ck(cublasStatus_t st, const char* what) {
-    if (st != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d\n", what, (int) st);
+    if (st != CUBLAS_STATUS_SUCCESS)
+        std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d (cuda: %s)\n", what, (int) st,
+                     cudaGetErrorString(cudaGetLastError()));
 }
 
 // EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the tensor-core
@@ -387,6 +395,7 @@ struct X3Lane {
     const strata::kernels::exl3::ExpertLayout* lay = nullptr;
     int E = 0, nff = 0;
     float limit = 0.0f;               // the experts' swiglu clamp
+    int T = 0;                        // the chunk's tokens (STRATA_GLM_EXL3_MMA_ROWS_SHORT; 0: unknown)
 };
 // experts [i0, i1) of a set through the tensor-core kernels, in parts whose rows fit the window and w16's h
 void x3_run_mma(const X3Lane& L, const uint8_t* wbase, size_t stride, const int* d_bounds, const int* hb, int r0, int i0,
@@ -503,13 +512,25 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     }
 }
 // one set's experts in set order (the window takes the rows in order): runs of light experts to the tensor cores, the
-// rest alone.  STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none)
+// rest alone.  STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none);
+// STRATA_GLM_EXL3_MMA_ROWS_SHORT=<rows>[,<max chunk tokens>]: that in a chunk of up to <max chunk tokens> (4096)
+// tokens instead (strata/core/exl3_mma_rows.hpp)
 void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                 int r0) {
-    static const int mma_rows = [] {
+    static const int mma_base = [] {
         const char* v = getenv("STRATA_GLM_EXL3_MMA_ROWS");
         return v ? std::max(0, std::atoi(v)) : 64;
     }();
+    static const strata::core::MmaRowsShort mma_short = [] {
+        const strata::core::MmaRowsShort r =
+            strata::core::mma_rows_short_parse(getenv("STRATA_GLM_EXL3_MMA_ROWS_SHORT"));
+        if (r.rows > 0)
+            std::fprintf(stderr, "glm prefill: EXL3 experts with up to %d rows through the tensor-core kernels in chunks "
+                                 "of up to %d tokens (MAYA_GLM_EXL3_MMA_ROWS_SHORT), %d in longer ones\n",
+                         r.rows, r.max_tokens, mma_base);
+        return r;
+    }();
+    const int mma_rows = strata::core::mma_rows_for(L.T, mma_base, mma_short);
     const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
     for (int i = 0; i < n_exp;) {
         const int rows = hb[i + 1] - hb[i];
@@ -782,6 +803,46 @@ struct Glm5Model::PrefillState {
     };
     bool trace = false;
     std::vector<Tr> tr;
+    // STRATA_GLM_PREFILL_STAGES (default on; =0 silences): the chunk's stage line.  A prompt chunk is one long copy
+    // lane (the staged experts) beside the compute stream, and nothing says where its wall goes: the profiling prints
+    // only at exit, the trace is a debug knob.  Events around every staging group's ring wait split the lane into the
+    // wait for the group's slot (the compute stream still reading it), the copies themselves, and the window between
+    // two layers' groups (the mixer, the host's plan, the prestage copies - where a lane that is going to idle,
+    // idles); the chunk's spans, its bytes and experts, and the hop in are printed when it ends, one line a part.
+    // The sync the line needs waits on nothing that is not already done: the compute stream waited on every group's
+    // last copy before it read it, and the copy stream's own queue is empty by then (a layer with no next MoE layer
+    // prestages none), so the host waits only for what has landed.  `0` beside a `--bench` A/B is what checks that.
+    bool stages = true;
+    std::vector<cudaEvent_t> sev;                  // triples a group, grown on demand and reused chunk to chunk
+    std::vector<std::pair<int, int>> sev_layer;    // a layer's stage events: [first, end) in sev
+    cudaEvent_t sev_a = nullptr, sev_b = nullptr;  // the chunk's span on the compute stream
+    cudaEvent_t sev_h0 = nullptr, sev_h1 = nullptr;   // ... and the hop in, on the receiving stream
+    bool sev_hop = false;                          // prefill_run recorded sev_h0/sev_h1 for the chunk prefill_half is
+                                                   // about to run (the head part has no hop, and reading an event that
+                                                   // was never recorded is an error, not a -1: it would fail the
+                                                   // chunk's own cudaGetLastError check)
+    size_t sn = 0;                                 // sev's used slots (a chunk)
+    int chunk_i = 0, chunk_n = 0;                  // this chunk's ordinal and the prompt's chunk count
+    // per chunk (they reset as the line prints): the bytes a lane staged, the experts, the host's plan and disk waits
+    uint64_t ct_vram = 0, ct_ram = 0, ct_disk = 0, ct_res = 0, ct_res_r = 0, ct_staged = 0, ct_pre = 0;
+    uint64_t ct_cpu_e = 0, ct_cpu_r = 0;
+    double ct_plan = 0, ct_disk_ms = 0, ct_cpu_ms = 0, ct_pre_ms = 0, ct_hop_in = 0;
+    // per prompt (prefill_run resets them, its summary line reads them): each part's chunk walls and hop-ins
+    double pr_wall = 0, pr_hop = 0;
+    // one stage event, created on demand and reused chunk to chunk (a create that fails leaves it null: the sums then
+    // read -1, which the line says)
+    void stage_mark(cudaStream_t st) {
+        if (sn >= sev.size()) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreate(&e) != cudaSuccess) {
+                cudaGetLastError();
+                e = nullptr;
+            }
+            sev.push_back(e);
+        }
+        if (sev[sn] != nullptr) cudaEventRecord(sev[sn], st);
+        ++sn;
+    }
 };
 
 // STRATA_GLM_PREFILL_CALC: one MoE layer's share for the waiting part - what the working part's plan gave it
@@ -865,6 +926,7 @@ bool Glm5Model::prefill_calc(const CalcJob& J, std::string& err) {
     L.row_tok = cb.row_tok;
     L.OUTP = cb.win;
     L.W = cb.W;
+    L.T = T;
     L.place = [&](int a, int nr) {
         if (!(w_hi > w_lo && a == w_hi && a + nr <= wb + cb.W)) {
             flush();
@@ -1085,8 +1147,15 @@ bool Glm5Model::prefill_setup(std::string& err) {
         stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
         stride_max = std::max(stride_max, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
     }
-    const int64_t keep = g.n_exp_used + gf::kSpares + 2;
-    const size_t avail = part_budget(dev_free, dev_total, (size_t) keep * stride_sum, stride_max).avail;
+    const int64_t keep = Glm5Model::pool_keep(g.n_exp_used);
+    if (getenv("STRATA_GLM_PREFILL_KEEP") != nullptr)
+        std::fprintf(stderr, "glm prefill: CUDA%d the pool keeps %lld slots a layer while a prompt runs "
+                             "(STRATA_GLM_PREFILL_KEEP; the floor is %d, Strata's is %d)\n",
+                     dev_, (long long) keep, g.n_exp_used + gf::kSpares, g.n_exp_used + gf::kSpares + 2);
+    size_t avail = part_budget(dev_free, dev_total, (size_t) keep * stride_sum, stride_max).avail;
+    // ... less the prompt path's MMQ scratch pool: fast_setup sizes the expert pool without it, so the lendable the
+    // chunk below is chosen against must be computed from the same number (mmq_scratch_reserve; 0 with the slab)
+    avail -= std::min(avail, mmq_scratch_reserve());
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
@@ -1256,6 +1325,34 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     cublasSetStream(S->blas, F->cs);
     cublasSetMathMode(S->blas, CUBLAS_DEFAULT_MATH);
+    // cuBLAS loads its kernels - and whatever device memory they need - lazily, on the first call on a device.  By
+    // the time a prompt runs the expert pool has taken the card, so that lazy load lands on a full card and fails:
+    // it is a launch that returns CUBLAS_STATUS_EXECUTION_FAILED with no CUDA error behind it (CUDA0 at 4.53 GB of a
+    // 7.53 GB 5060, 110 MB free, failed on every GEMM of the chunk; the same card at 480 MB free ran them).  One
+    // small GEMM of each kind now, while the pool is not allocated yet, and the pool's fill cannot take it away.
+    {
+        void *wa = nullptr, *wb = nullptr, *wc = nullptr, *wws = nullptr;
+        if (cudaMalloc(&wa, 4096) == cudaSuccess && cudaMalloc(&wb, 4096) == cudaSuccess &&
+            cudaMalloc(&wc, 4096) == cudaSuccess && cudaMalloc(&wws, kPfWorkspace) == cudaSuccess) {
+            const float one = 1.0f, zero = 0.0f;
+            blas_ck(cublasSetWorkspace(S->blas, wws, kPfWorkspace), "warm-up set workspace");
+            const cublasStatus_t w1 = cublasSgemm(S->blas, CUBLAS_OP_N, CUBLAS_OP_N, 16, 16, 16, &one,
+                                                  (const float*) wa, 16, (const float*) wb, 16, &zero, (float*) wc, 16);
+            const cublasStatus_t w2 =
+                cublasGemmEx(S->blas, CUBLAS_OP_N, CUBLAS_OP_N, 16, 16, 16, &one, wa, CUDA_R_16F, 16, wb, CUDA_R_16F,
+                             16, &zero, wc, CUDA_R_32F, 16, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            const cudaError_t we = cudaStreamSynchronize(F->cs);
+            std::fprintf(stderr, "glm prefill: CUDA%d cuBLAS warm-up: sgemm %d, gemm f16 %d, sync %s\n", dev_,
+                         (int) w1, (int) w2, cudaGetErrorString(we));
+        } else {
+            cudaGetLastError();
+            std::fprintf(stderr, "glm prefill: CUDA%d cuBLAS warm-up skipped (no scratch)\n", dev_);
+        }
+        if (wa != nullptr) cudaFree(wa);
+        if (wb != nullptr) cudaFree(wb);
+        if (wc != nullptr) cudaFree(wc);
+        if (wws != nullptr) cudaFree(wws);
+    }
     S->mq = std::make_unique<mmq::Context>();
     // an event that did not create (a GPU the expert pool filled) stays null and the prompt runs token by token:
     // the staging below records and waits on every one of them, and a null event there is no event at all
@@ -1303,6 +1400,15 @@ bool Glm5Model::prefill_setup(std::string& err) {
         S->tr.resize((size_t) g.n_layers);
         for (auto& t : S->tr)
             for (cudaEvent_t* e : {&t.start, &t.plan, &t.pre, &t.c1, &t.end}) cudaEventCreate(e);
+    }
+    {
+        const char* v = getenv("STRATA_GLM_PREFILL_STAGES");
+        S->stages = v == nullptr || std::atoi(v) != 0;
+        if (S->stages) {   // (a create that fails leaves the event null and the line's sums read -1)
+            for (cudaEvent_t* e : {&S->sev_a, &S->sev_b, &S->sev_h0, &S->sev_h1}) cudaEventCreate(e);
+            std::fprintf(stderr, "glm prefill: CUDA%d the chunk stage line is on (STRATA_GLM_PREFILL_STAGES=0 "
+                                 "silences it)\n", dev_);
+        }
     }
     std::fprintf(stderr, "glm prefill: CUDA%d chunks of %d tokens (--prefill %s; mixer sub-batches of %d), borrowing "
                          "%.0f MB of the expert pool while a prompt runs (activations %.0f, weight scratch %.0f, expert "
@@ -1449,9 +1555,12 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->iota = a.take<int>(T * (size_t) g.n_exp_used);
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
-    cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
+    blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
     S->T_bound = Tn;
     S->need = c.off;
+    if (S->region != nullptr && S->need > S->region_bytes)
+        std::fprintf(stderr, "glm prefill: CUDA%d the layout needs %zu bytes of a %zu-byte loan\n", dev_, S->need,
+                     S->region_bytes);
     return c.off;
 }
 
@@ -1462,7 +1571,36 @@ bool Glm5Model::prefill_lend(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
-    if (!lend_tail(S->need, S->moved, S->dropped, err)) return false;
+    // The MMQ kernels' scratch (their stream-k fixup tiles, allocated through ggml_cuda_pool) rides in the loan: the
+    // lending frees kMmqSlab bytes past this layout's need and [need, need + kMmqSlab) is where the pool's buffers
+    // live.  It costs no cudaMalloc - and on a card whose free VRAM is a few MB by the time a chunk runs (measured:
+    // CUDA1 wanting 1.2 MB with 3.4 MB of 7,707 MB left) that cudaMalloc is what aborted the engine mid-prompt.
+    //
+    // kMmqSlab is a bound, not a guess.  mmq.cuh allocates block_nums_stream_k.x * J*I floats for the stream-k fixup
+    // only when the problem is a poor tile fit, and then block_nums_stream_k.x is nsm (30/28 here), never ntiles_dst
+    // (a perfect fit needs no fixup at all) - so a buffer is at most nsm * J * I * 4 with J from its 8..128 search,
+    // i.e. 2 MB, whatever the chunk is.  The pool rounds those to size classes (128 KB .. 2 MB), so a chunk's
+    // products - gate/up and down here - hold ~4 MB each: 16 MB covers them with room for a third.  Lending the few
+    // slots that pay for it is the cheap side of the trade: those experts go to the RAM tier and come back as spares,
+    // while a VRAM reserve big enough to matter on CUDA1 (it lends 3021 MB of a 3048 MB maximum) would halve its
+    // chunk - which is exactly what the flatten-to-smallest rule then spreads to all four parts.
+    const uint64_t dropped_before = S->dropped;
+    if (!lend_tail(S->need + kMmqSlab, S->moved, S->dropped, err)) return false;
+    {
+        const size_t base = (size_t) (S->region + S->need);
+        const size_t end = std::min((size_t) (S->region + S->need + kMmqSlab), F->lend_end);
+        const size_t nbytes = end > base ? end - base : 0;
+        mmq::pool_slab(dev_, nbytes > 0 ? (void*) base : nullptr, nbytes);
+        static bool said[8] = {};
+        if (dev_ >= 0 && dev_ < 8 && !said[dev_]) {
+            said[dev_] = true;
+            std::fprintf(stderr,
+                         "glm prefill: CUDA%d the MMQ scratch pool has %.1f MB of the loan (%.1f MB past the layout's "
+                         "need; %llu experts more lent for it)\n",
+                         dev_, (double) nbytes / 1048576.0, (double) kMmqSlab / 1048576.0,
+                         (unsigned long long) (S->dropped - dropped_before));
+        }
+    }
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
     mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used, F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
@@ -1551,6 +1689,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         return false;
     }
     const int NE = g_.n_expert;
+    F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
     {
         std::lock_guard<std::mutex> lk(F->mu);
         int nu = 0;
@@ -1593,18 +1732,37 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                 if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
             if (rs < 0) {
-                uint32_t bc = F->cnt[(size_t) key];
-                for (int s2 = 0; s2 < R.n; ++s2)
-                    if (R.st[(size_t) s2] == FastState::kRHold && !parked[(size_t) R.key[(size_t) s2]] &&
-                        F->cnt[(size_t) R.key[(size_t) s2]] < bc) {
-                        bc = F->cnt[(size_t) R.key[(size_t) s2]];
+                // the victim: a RAM-tier expert of a lower LFU count - and on EQUAL counts the one a route used less
+                // recently (STRATA_GLM_LEND_PARK_LRU=0: strictly lower only, as before).  The counts age (all halve every
+                // 32768 routing events), so most sit at the same small value, often 0, and the strict rule picked badly:
+                // Maya-S24, one V100, 512 tokens after a fresh 24K prompt (the run's second lend), two rounds each, disk
+                // reads 520-578 -> 309-317, of them the lend's RAM victims 392-465 -> 208-213; decode 31.6-32.5 ->
+                // 33.1-33.3 tok/s, VRAM hits 72.2-74.0 -> 73.7-74.5 %
+                static const bool lru_ties = getenv("STRATA_GLM_LEND_PARK_LRU") == nullptr ||
+                                             std::atoi(getenv("STRATA_GLM_LEND_PARK_LRU")) != 0;
+                // ... and on equal recency too (the first prompt after a load: every count and tick alike, 30 of 450 lent
+                // experts parked) the one of the lower long-term usage (the profile the warm-up placed them by)
+                const auto use = [&](int k) { return F->usage.empty() ? 0u : F->usage[(size_t) k]; };
+                uint32_t bc = F->cnt[(size_t) key], bu = use(key);
+                uint64_t bt = F->lp[(size_t) il].tick[(size_t) s];
+                for (int s2 = 0; s2 < R.n; ++s2) {
+                    if (R.st[(size_t) s2] != FastState::kRHold || parked[(size_t) R.key[(size_t) s2]]) continue;
+                    const int k2 = R.key[(size_t) s2];
+                    const uint32_t c = F->cnt[(size_t) k2], u = use(k2);
+                    const uint64_t t = R.tick[(size_t) s2];
+                    if (c < bc || (lru_ties && c == bc && (t < bt || (t == bt && u < bu)))) {
+                        bc = c;
+                        bt = t;
+                        bu = u;
                         rs = s2;
                     }
+                }
                 if (rs < 0) return false;
                 const int old = R.key[(size_t) rs];
                 upd(F->rtab_key((size_t) old), 0ull);
                 F->ram_of[(size_t) old] = -1;
-                F->left[(size_t) old] = 2;
+                F->left[(size_t) old] = 4;
+                ++F->diag_lend_evict;
             }
             // on the compute stream: the prompt's work behind it cannot overwrite the slot before the copy read it
             if (!glmfast::cuda_ok(cudaMemcpyAsync(R.base + (size_t) rs * R.stride,
@@ -1639,11 +1797,20 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             size_t ci = 0;
             for (int s = P.n_main; s < P.n; ++s) {
                 // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) continue;
+                if (P.slot_ptr(s) >= F->xpool + limit) {
+                    // ... and it is the first live byte of this layer's tail: what precedes it is a loan nobody uses
+                    F->lend_end = std::min(F->lend_end, (size_t) P.slot_ptr(s));
+                    continue;
+                }
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
-                    if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
+                    static const bool lru_ties = getenv("STRATA_GLM_LEND_PARK_LRU") == nullptr ||
+                                                 std::atoi(getenv("STRATA_GLM_LEND_PARK_LRU")) != 0;
+                    if (ci < cold.size() &&
+                        (cold[ci].first < (uint64_t) F->cnt[(size_t) key] ||
+                         (lru_ties && cold[ci].first == (uint64_t) F->cnt[(size_t) key] &&
+                          P.tick[(size_t) cold[ci].second] < P.tick[(size_t) s]))) {
                         const int v = cold[ci++].second;   // the coldest: it goes, this expert takes its slot
                         const int vkey = il * NE + P.key[(size_t) v];
                         const bool parked = park(il, v, vkey);   // (read before the copy below overwrites the slot)
@@ -1692,6 +1859,7 @@ bool Glm5Model::prefill_return(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || !S->lent) return true;
     cudaSetDevice(dev_);
+    mmq::pool_slab(dev_, nullptr, 0);   // the region goes back to the decode's experts: the scratch's loan is over
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm return compute", err) ||
         !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm return copies", err) ||
         (S->kv_ss && !glmfast::cuda_ok(cudaStreamSynchronize(S->kv_ss), "glm return KV stage", err))) return false;
@@ -1770,6 +1938,10 @@ void Glm5Model::prefill_destroy() {
         if (p) cudaFreeHost(p);
     for (auto e : S->ev_land)
         if (e) cudaEventDestroy(e);
+    for (auto e : S->sev)   // (the stage line's: grown on demand, one pool per part)
+        if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : {S->sev_a, S->sev_b, S->sev_h0, S->sev_h1})
+        if (e) cudaEventDestroy(e);
     if (S->ev_hop) cudaEventDestroy(S->ev_hop);
     if (S->gpin) cudaFreeHost(S->gpin);
     if (S->emb_h) cudaFreeHost(S->emb_h);
@@ -1790,6 +1962,43 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const cudaStream_t s = F->cs;
     const int E = g.n_embd, DI = g.d_inner(), HD = g.kda_head_dim, K = g.n_exp_used;
     const float one = 1.0f, zero = 0.0f;
+    {   // an error left in the thread's state by an earlier kernel is what the first cuBLAS call reports
+        const cudaError_t stale = cudaGetLastError();
+        if (stale != cudaSuccess)
+            std::fprintf(stderr, "glm prefill: CUDA%d stale CUDA error before this chunk's layers: %s\n", dev_,
+                         cudaGetErrorString(stale));
+    }
+
+    // the first GEMM a device fails, in full: its arguments, where A/B/C sit in the lent region, the layout's
+    // numbers and the card's free VRAM.  A cuBLAS refusal leaves no CUDA error behind when it never launched the
+    // kernel, so blas_ck's status alone could not say which of the two it was - this is what found that one
+    const auto gemm_fail = [&](cublasStatus_t st, const char* what, const void* A, const void* B, const void* C, int m,
+                               int n, int k, int lda, int ldb, int ldc) {
+        if (st == CUBLAS_STATUS_SUCCESS) return;
+        static bool once[8] = {};
+        if (dev_ < 0 || dev_ >= 8 || once[dev_]) return;
+        once[dev_] = true;
+        int cur = -1;
+        (void) cudaGetDevice(&cur);
+        const uint8_t* R = S->region;
+        const auto off = [&](const void* p) -> long long {
+            return (p == nullptr || R == nullptr) ? -1 : (long long) ((const uint8_t*) p - R);
+        };
+        std::fprintf(stderr,
+                     "glm prefill diag: CUDA%d %s failed %d: m=%d n=%d k=%d lda=%d ldb=%d ldc=%d A=%p B=%p C=%p "
+                     "A_off=%lld B_off=%lld C_off=%lld region=%p bytes=%zu need=%zu T=%d sub=%d\n",
+                     dev_, what, (int) st, m, n, k, lda, ldb, ldc, A, B, C, off(A), off(B), off(C), (const void*) R,
+                     S->region_bytes, S->need, S->T, S->sub);
+        size_t freeb = 0, totb = 0;
+        (void) cudaMemGetInfo(&freeb, &totb);
+        std::fprintf(stderr,
+                     "glm prefill diag: CUDA%d w16=%p(%zu) w32=%p(%zu) ws=%p(%zu) gbuf=%p(%zu) pbuf=%p(%zu) blas=%p "
+                     "cs=%p curdev=%d free=%zuMB of %zuMB cuda=%s\n",
+                     dev_, (const void*) S->w16, S->w16_elems, (const void*) S->w32, S->w32_elems, (const void*) S->ws,
+                     S->ws_bytes, (const void*) S->gbuf, S->gbuf_bytes, (const void*) S->pbuf, S->pbuf_bytes,
+                     (const void*) S->blas, (const void*) F->cs, cur, freeb >> 20, totb >> 20,
+                     cudaGetErrorString(cudaGetLastError()));
+    };
 
     // Y[t][N] (row stride ldy) = alpha * X[t][K] (F32, row stride ldx) . W[N][K]^T, W BF16 (widened in slices)
     const auto sgemm_bf16 = [&](const uint16_t* W, int N, int Kd, const float* X, int ldx, float* Y, int ldy, int Tn,
@@ -1798,9 +2007,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         for (int r0 = 0; r0 < N; r0 += rows) {
             const int n = std::min(rows, N - r0);
             gb::bf16_to_f32(W + (size_t) r0 * Kd, S->w32, (int64_t) n * Kd, s);
-            blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &alpha, S->w32, Kd, X, ldx, &zero, Y + r0,
-                                ldy),
-                    "sgemm");
+            {   // an error the widen kernels left behind would be what this GEMM reports as its own
+                static bool once = false;
+                if (!once) {
+                    once = true;   // an error the widen kernels left behind would be what the GEMM below reports
+                    const cudaError_t e = cudaGetLastError();
+                    if (e != cudaSuccess)
+                        std::fprintf(stderr, "glm prefill: CUDA%d stale CUDA error before the first GEMM: %s\n", dev_,
+                                     cudaGetErrorString(e));
+                }
+            }
+            const cublasStatus_t st = cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &alpha, S->w32, Kd, X,
+                                                  ldx, &zero, Y + r0, ldy);
+            gemm_fail(st, "sgemm", S->w32, X, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
+            blas_ck(st, "sgemm");
         }
     };
     // Y[t][N] = X16[t][K] . deq(W)[N][K]^T (tensor cores, F32 accumulate); beta = 1 adds to Y.  A BF16 weight (a
@@ -1842,10 +2062,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 continue;
             }
 #endif
-            blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16, CUDA_R_16F, Kd, X16,
-                                 CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
-                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                    "gemm f16");
+            const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16,
+                                                   CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,
+                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            gemm_fail(st, "gemm f16", S->w16, X16, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
+            blas_ck(st, "gemm f16");
         }
     };
     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16
@@ -2210,6 +2431,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->calc_share = std::min(0.9, std::max(0.05, S->calc_share * std::min(1.25, std::max(0.8, std::sqrt(want / tb)))));
     };
     S->mark("start", s);
+    const bool hop_on = S->sev_hop;   // (this chunk's hand-over, if it came over one: read once, here)
+    S->sev_hop = false;
+    if (S->stages) {   // (the stage line's events: the chunk's span starts here; the counters reset as the line prints)
+        S->sn = 0;
+        S->sev_layer.clear();
+        if (S->sev_a != nullptr) cudaEventRecord(S->sev_a, s);
+    }
     if (!kv_prefetch(kv_dsa_from(l0_))) return false;   // (the layers before the first DSA layer run meanwhile)
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
@@ -2598,6 +2826,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         int n_light = 0, rows_mmq = 0;
         int b_pre = -1, rows_pre = 0, max_pre = 0;   // the prestaged set: its bounds, rows and largest expert
         const int pre_n = S->pre_layer == il ? (int) S->pre_e.size() : 0;
+        if (S->stages) S->ct_pre += (uint64_t) pre_n;
         int* h_light = S->h_bounds + kLightOff;
         {
             std::lock_guard<std::mutex> lk(F->mu);
@@ -2821,7 +3050,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaMemcpyAsync(S->rt_h, M.row_tok + cpu_r0, (size_t) cpu_nrows * sizeof(int), cudaMemcpyDeviceToHost, S->xs);
         }
         S->mark("plan", s);
-        S->ms_plan += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+        const double plan_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+        S->ms_plan += plan_ms;
+        if (S->stages) S->ct_plan += plan_ms;
         // EXL3: the host's experts (cpu_set) on a thread of their own from here, while this one enqueues the staged
         // experts' copies and products - that loop blocks once the device's launch queue is full, and the host's
         // experts, queued after it, started near the end of the copies they were planned beside (an 8K prompt on one
@@ -3125,6 +3356,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         x3l.row_tok = M.row_tok;
         x3l.OUTP = M.OUTP;
         x3l.W = W;
+        x3l.T = T;
         x3l.place = place;
         x3l.lay = &Ly.xl;
         x3l.E = E;
@@ -3306,6 +3538,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         run_any(P.base, P.n_main, P.stride, M.bounds + b_res, S->h_bounds + b_res, 0);
         (void) max_res;
         S->rows_resident += (uint64_t) rows_res;
+        if (S->stages) {
+            S->ct_res += (uint64_t) P.n_main;
+            S->ct_res_r += (uint64_t) rows_res;
+        }
         S->mark("moe_resident", s);
         if (S->pre_layer == il) {
             if (rows_pre > 0) {
@@ -3320,14 +3556,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         int dk = 0;   // the next disk expert (index into dlist / gidx)
         int n_staged_pcie = 0;   // (the split's balance: the copy stream's time when the host computes experts too)
         for (const auto& st : staged) n_staged_pcie += st.dev ? 0 : 1;
+        const int ev_base = (int) S->sn;
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             const Group& gr = groups[gi];
             const int b = (int) (gi % PrefillState::NG);
             uint8_t* gdst = S->gbuf + (size_t) b * PrefillState::GE * P.stride;
+            if (S->stages) S->stage_mark(F->copy);   // the lane's last copy is in: from here it waits for the ring
             cudaStreamWaitEvent(F->copy, S->ev_free[b], 0);
             Glm5Model* const H = S->help;
             bool h_used = false;
             const size_t h_stride = H != nullptr ? H->pf_->gbuf_bytes / ((size_t) PrefillState::NG * PrefillState::GE) : 0;
+            if (S->stages) S->stage_mark(F->copy);   // the group's staging slot is free
             const int dk0 = dk;
             for (int j = 0; j < gr.n; ++j) {
                 const Staged& st = staged[(size_t) gr.first + j];
@@ -3366,7 +3605,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
                 S->staged_ram += st.ram != nullptr && !st.dev;
                 S->staged_vram += st.dev;
+                if (S->stages) {   // (the bytes the lane moves: ram and disk cross PCIe, a vram expert is a device copy)
+                    if (st.ram == nullptr) S->ct_disk += Ly.blob;
+                    else if (st.dev) S->ct_vram += Ly.blob;
+                    else S->ct_ram += Ly.blob;
+                }
             }
+            if (S->stages) S->stage_mark(F->copy);   // the copies are in
             (void) dk0;
             cudaEventRecord(S->ev_ready[b], F->copy);
             cudaStreamWaitEvent(s, S->ev_ready[b], 0);
@@ -3379,6 +3624,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             run_any(gdst, gr.n, P.stride, M.bounds + gr.b_off, S->h_bounds + gr.b_off, gr.r0);
             cudaEventRecord(S->ev_free[b], s);
             S->rows_staged += (uint64_t) gr.nrows;
+        }
+        if (S->stages) {
+            S->ct_staged += (uint64_t) staged.size();
+            if (S->sn > (size_t) ev_base) S->sev_layer.emplace_back(ev_base, (int) S->sn);
         }
         dq.copied.store(std::max(dq.copied.load(), seg_end), std::memory_order_release);   // predicted, never routed
         S->staged_disk += dlist.size();
@@ -3569,6 +3818,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             S->cpu_experts += (uint64_t) ncx;
             S->cpu_rows += (uint64_t) cpu_nrows;
             S->ms_cpu += dt;
+            if (S->stages) {
+                S->ct_cpu_e += (uint64_t) ncx;
+                S->ct_cpu_r += (uint64_t) cpu_nrows;
+                S->ct_cpu_ms += dt;
+            }
             if (S->trace) {
                 S->tr[(size_t) il].dcpu = dt;
                 S->tr[(size_t) il].dl = std::chrono::duration<double, std::milli>(tend - tp).count();
@@ -3597,6 +3851,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     cudaEventElapsedTime(&pc, S->ev_c0, S->ev_c1) == cudaSuccess &&
                     cudaEventElapsedTime(&pt, S->ev_pstart, S->ev_pready) == cudaSuccess) {
                     const double cm = pt / pre_n;   // (the copies ran back to back from ev_pstart)
+                    if (S->stages) S->ct_pre_ms += (double) pt;
                     if (cm > 0.2 && cm < 20.0) S->copy_ms = S->copy_ms > 0.0 ? 0.8 * S->copy_ms + 0.2 * cm : cm;
                     const double pm = S->copy_ms > 0.0 ? S->copy_ms : 1.6;
                     double nn = pre_n;
@@ -3809,6 +4064,77 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                          el(t.plan, t.c1), t.ncpu, t.crows, t.dl, t.dcpu, el(t.plan, t.end), calc);
         }
     }
+    if (S->stages) {
+        // the chunk's stage line: where its wall went - the copy lane's ring waits (the group's staging slot still
+        // being read), its copies, the gaps inside a layer's groups and the windows between two layers' groups (the
+        // mixer and the host's plan: where a lane that is going to idle, idles), with the lane's own span's lead and
+        // tail beside it (lead + lane + tail = wall) - and the bytes and experts each lane moved.  The waits below are
+        // the chunk's own: the compute stream waited on every group's last copy before reading it, so nothing of the
+        // chunk's is still in flight (the last MoE layer prestages no next one).
+        if (S->sev_b != nullptr) cudaEventRecord(S->sev_b, s);
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt stages", err)) return false;
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm prompt stages", err)) return false;
+        const auto el = [](cudaEvent_t a, cudaEvent_t b) {
+            float v = 0.0f;
+            if (a == nullptr || b == nullptr) return -1.0;
+            if (cudaEventElapsedTime(&v, a, b) != cudaSuccess) {
+                cudaGetLastError();   // (the query's own: an event with nothing recorded reads -1, and the line says
+                return -1.0;          //  so - the chunk's own cudaGetLastError check below must not see it)
+            }
+            return (double) v;
+        };
+        const auto at = [&](int i) { return (size_t) i < S->sev.size() ? S->sev[(size_t) i] : nullptr; };
+        // the lane's own span is [first group in, last group's copies landed]: before it (lead) the chunk's dense and
+        // attention layers run, behind it (tail) the last MoE layer's experts compute and the rest of the chunk does
+        double wait = 0, busy = 0, windows = 0, inner = 0, lmax = 0, lmin = 1e30;
+        int prev_c = -1, first_a = -1, last_c = -1;
+        for (const auto& se : S->sev_layer) {
+            const int a = se.first, z = se.second;
+            if (first_a < 0) first_a = a;
+            if (prev_c >= 0) windows += el(at(prev_c), at(a));   // this layer's plan and mixer, the lane idle
+            const double lb = el(at(a), at(z - 1));              // the layer's own occupancy of the lane
+            if (lb >= 0.0) {
+                lmax = std::max(lmax, lb);
+                lmin = std::min(lmin, lb);
+            }
+            for (int k = a; k + 2 < z; k += 3) {
+                wait += el(at(k), at(k + 1));
+                busy += el(at(k + 1), at(k + 2));
+                if (k + 3 < z) inner += el(at(k + 2), at(k + 3));
+            }
+            prev_c = z - 1;
+            last_c = z - 1;
+        }
+        const double wall = el(S->sev_a, S->sev_b);
+        const double lead = first_a >= 0 ? el(S->sev_a, at(first_a)) : 0.0;
+        const double tail = last_c >= 0 ? el(at(last_c), S->sev_b) : wall;
+        const double lane = wait + busy + windows + inner;       // == last_c - first_a: lead + lane + tail = wall
+        const double hm = hop_on ? el(S->sev_h0, S->sev_h1) : -1.0;   // (the chunk's hand-over; the head has none)
+        if (hm >= 0.0) S->ct_hop_in += hm;
+        const double gb = 1073741824.0;
+        const double moved = (double) (S->ct_ram + S->ct_disk) / gb;
+        char line[1024];
+        std::snprintf(line, sizeof line,
+                      "glm prefill: CUDA%d chunk %d/%d, %d tokens, wall %.0f ms | the copy lane %.0f ms: copies %.0f "
+                      "(%.1f GB/s), ring wait %.0f, gaps %.0f, mixer windows %.0f | lead %.0f, tail %.0f | pcie %.2f GB "
+                      "(ram %.2f, disk %.2f) + %.2f GB vram | experts: staged %llu, resident %llu (%llu rows), "
+                      "prestaged %llu, cpu %llu (%llu rows, %.0f ms) | plan %.0f ms host, disk wait %.0f ms, hop in "
+                      "%.0f ms | layer lane %.1f/%.1f ms max/min%s\n",
+                      dev_, S->chunk_i, S->chunk_n, T, wall, lane, busy,
+                      busy > 1.0 ? moved / (busy / 1000.0) : 0.0, wait, inner, windows, lead, tail, moved,
+                      (double) S->ct_ram / gb, (double) S->ct_disk / gb, (double) S->ct_vram / gb,
+                      (unsigned long long) S->ct_staged, (unsigned long long) S->ct_res,
+                      (unsigned long long) S->ct_res_r, (unsigned long long) S->ct_pre,
+                      (unsigned long long) S->ct_cpu_e, (unsigned long long) S->ct_cpu_r, S->ct_cpu_ms, S->ct_plan,
+                      S->ct_disk_ms, S->ct_hop_in, lmax, lmin < 1e30 ? lmin : 0.0,
+                      S->sev_layer.empty() ? " (no staged groups)" : "");
+        std::fprintf(stderr, "%s", line);
+        S->pr_wall += std::max(0.0, wall);
+        S->pr_hop += S->ct_hop_in;
+        S->ct_vram = S->ct_ram = S->ct_disk = S->ct_res = S->ct_res_r = S->ct_staged = S->ct_pre = 0;
+        S->ct_cpu_e = S->ct_cpu_r = 0;
+        S->ct_plan = S->ct_disk_ms = S->ct_cpu_ms = S->ct_pre_ms = S->ct_hop_in = 0;
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         err = std::string("glm prefill: ") + cudaGetErrorString(e);
@@ -3845,6 +4171,32 @@ bool Glm5Model::dump_state(const std::string& path) {
 }
 
 // ---------------------------------------------------------------- the prompt
+int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice below, prefill_min_chunks 1)
+    if (pf_ == nullptr || nn <= 0) return 0;
+    int Tmax = pf_->T;
+    for (const Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
+        if (m->pf_ == nullptr) return 0;
+        Tmax = std::min(Tmax, m->pf_->T);
+    }
+    return strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
+}
+
+// The fewest chunks a split cuts a call of nn tokens into: the call's own floor (prefill_min_chunks, none under 256
+// tokens) or STRATA_GLM_PREFILL_MIN_CHUNKS's (strata/core/prefill_chunks.hpp), whichever is more; one GPU: 1
+int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
+    static const strata::core::PrefillMinChunks set = [] {
+        const strata::core::PrefillMinChunks s =
+            strata::core::prefill_min_chunks_parse(getenv("STRATA_GLM_PREFILL_MIN_CHUNKS"));
+        if (s.n > 1)
+            std::fprintf(stderr, "glm prefill: on a split a prompt-path call is cut into %d chunks at least, none under "
+                                 "%d tokens (MAYA_GLM_PREFILL_MIN_CHUNKS), so the parts pipeline it\n", s.n, s.min_tokens);
+        return s;
+    }();
+    if (split_next_ == nullptr) return 1;
+    return std::max(strata::core::prefill_floor_chunks(nn, call_min, 256),
+                    strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
+}
+
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
     err.clear();
     prefill_next_ = next_token;
@@ -3862,11 +4214,14 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + Tmax - 1) / Tmax;
+    const int64_t nn = (int64_t) tokens.size();
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
-    // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                            : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s).
+    // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)
+    const int Trun = prefill_force_chunk > 0
+                         ? std::min(Tmax, prefill_force_chunk)
+                         : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                                                           prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -4117,6 +4472,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) parts.push_back(m);
     const int np = (int) parts.size();
     const bool pipelined = np > 1 && nc > 1 && getenv("STRATA_GLM_PREFILL_SERIAL") == nullptr;
+    for (Glm5Model* m : parts) {   // (the stage lines' per-prompt sums: the parts accumulate them chunk by chunk)
+        m->pf_->pr_wall = 0;
+        m->pf_->pr_hop = 0;
+    }
     bool cancelled = false;
     // DUAL-LINK PROMPT (STRATA_GLM_DUAL_PREFILL=1; see PrefillState::help): only here, where one half runs while the
     // other waits - in the pipeline both GPUs' links are busy with their own chunks
@@ -4169,6 +4528,23 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         cudaStreamWaitEvent(H->fast_->copy, H->pf_->ev_hidle, 0);
         cudaSetDevice(owner->dev_);
     };
+    // STRATA_GLM_PREFILL_GAPS (prefill_gap): the other requests' decode at a chunk boundary of this read, every part
+    // idle - not with the dual-link prompt (a part's helper works in the other part's memory) nor with the waiting
+    // part computing a share (STRATA_GLM_PREFILL_CALC: its buffers and turns span the halves)
+    const bool gaps = np > 1 && !dual && !calc && prefill_gap && prefill_gap_wanted;
+    uint64_t gaps_run = 0;
+    double gaps_ms = 0.0;
+    // one gap: 0 go on, else the read ends (e: "cancelled" for 1)
+    const auto run_gap = [&](std::string& e) -> int {
+        const auto g0 = std::chrono::steady_clock::now();
+        const int r = prefill_gap();
+        cudaSetDevice(dev_);
+        ++gaps_run;
+        gaps_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - g0).count();
+        if (r == 1) e = "cancelled";
+        else if (r != 0) e = "glm prefill: the decode between the prompt's chunks failed";
+        return r;
+    };
     if (!pipelined) {
         // one half after the other, chunk by chunk
         for (int c = 0; c < nc; ++c) {
@@ -4181,28 +4557,47 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             if (mtp_il_ >= 0) next_of(c, nx0, im0);   // a single device carries the draft block itself
             help_idle(this);
             turn(this);
+            pf_->chunk_i = c + 1;
+            pf_->chunk_n = nc;
             if (!prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data(), im0.empty() ? nullptr : im0.data()))
                 return false;
             Glm5Model* prev = this;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
                 PrefillState* SP = prev->pf_;
                 const size_t hop = (size_t) T * 4 * E * sizeof(float);
+                // (gaps: between two parts' halves of the chunk - the earlier part done, the later one not begun)
+                if (gaps && prefill_gap_wanted()) {
+                    cudaSetDevice(prev->dev_);
+                    if (!glmfast::cuda_ok(cudaStreamSynchronize(prev->fast_->cs), "glm prompt gap", err)) return false;
+                    const int r = run_gap(err);
+                    if (r == 1) {
+                        cancelled = true;
+                        break;
+                    }
+                    if (r != 0) return false;
+                }
                 cudaSetDevice(prev->dev_);
                 cudaMemcpyAsync(SP->hop_h, SP->R, hop, cudaMemcpyDeviceToHost, prev->fast_->cs);
                 cudaEventRecord(SP->ev_hop, prev->fast_->cs);
                 cudaSetDevice(m->dev_);
                 cudaStreamWaitEvent(m->fast_->cs, SP->ev_hop, 0);
+                if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
+                m->pf_->sev_hop = m->pf_->stages;   // (m->prefill_half below reads it: this chunk came over the hop)
                 cudaMemcpyAsync(m->pf_->R, SP->hop_h, hop, cudaMemcpyHostToDevice, m->fast_->cs);
+                if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
                 m->pos_ = p0;
                 std::vector<int32_t> nx;
                 std::vector<const float*> im;
                 if (m->mtp_il_ >= 0) next_of(c, nx, im);
                 help_idle(m);
                 turn(m);
+                m->pf_->chunk_i = c + 1;
+                m->pf_->chunk_n = nc;
                 if (!m->prefill_half(p0, T, err, nx.empty() ? nullptr : nx.data(), im.empty() ? nullptr : im.data()))
                     return false;
                 prev = m;
             }
+            if (cancelled) break;
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
             ++pf_->chunks;
@@ -4219,6 +4614,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         std::condition_variable cv;
         // produced[k]: chunks part k has put in its slots; consumed[k]: chunks part k + 1 has copied out of them
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
+        // gaps: the chunks each part has read and the boundaries released (strata/core/prefill_gaps.hpp)
+        strata::core::PipelineGaps G(np, nc);
         bool stop = false;
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
@@ -4259,13 +4656,16 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 for (int c = 0; c < nc; ++c) {
                     {
                         std::unique_lock<std::mutex> lk(mu);
-                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop; });
+                        cv.wait(lk, [&] { return (produced[(size_t) k - 1] > c && (!gaps || G.may_start(k, c))) || stop; });
                         if (stop) return;
                     }
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
+                    if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
+                    m->pf_->sev_hop = m->pf_->stages;   // (this chunk arrived over the hop: the line below reads it)
                     cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
                                     (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
+                    if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
                     std::string e2;
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt hop in", e2)) {
                         fail(e2);
@@ -4280,12 +4680,23 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     std::vector<int32_t> nx;
                     std::vector<const float*> im;
                     if (m->mtp_il_ >= 0) next_of(c, nx, im);
+                    m->pf_->chunk_i = c + 1;
+                    m->pf_->chunk_n = nc;
                     if (!m->prefill_half(p0, T, e2, nx.empty() ? nullptr : nx.data(), im.empty() ? nullptr : im.data())) {
                         fail(e2.empty() ? "glm prefill: part " + std::to_string(k) + " failed" : e2);
                         return;
                     }
+                    // (gaps: a part has read its chunk once its stream is synchronized - the hop out does it here)
+                    const auto read_done = [&] {
+                        {
+                            std::lock_guard<std::mutex> lk(mu);
+                            G.finished[(size_t) k] = c + 1;
+                        }
+                        cv.notify_all();
+                    };
                     if (k + 1 < np) {
                         if (!hand_on(k, c, T)) return;
+                        read_done();
                         continue;
                     }
                     if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prompt pipeline", e2)) {
@@ -4297,6 +4708,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         fail("cancelled");
                         return;
                     }
+                    read_done();
                 }
             });
         cudaSetDevice(dev_);
@@ -4309,12 +4721,35 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             const int64_t p0 = pos_start + (int64_t) c * Tc;
             if (!embed(c)) { fail(err); break; }
             std::string e1;
+            pf_->chunk_i = c + 1;
+            pf_->chunk_n = nc;
             if (!prefill_half(p0, T, e1)) {
                 fail(e1.empty() ? "glm prefill: the head half failed" : e1);
                 break;
             }
             if (!hand_on(0, c, T)) break;
             ++pf_->chunks;
+            // gaps: boundary c - once every later part has read its chunk before it, the other requests decode, then
+            // the parts go on (part 1 with chunk c, this thread with c + 1)
+            if (gaps && c + 1 < nc) {
+                if (prefill_gap_wanted()) {
+                    {
+                        std::unique_lock<std::mutex> lk(mu);
+                        cv.wait(lk, [&] { return G.all_idle(c) || stop; });
+                        if (stop) break;
+                    }
+                    std::string e0;
+                    if (run_gap(e0) != 0) {
+                        fail(e0);
+                        break;
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mu);
+                    G.released = c;
+                }
+                cv.notify_all();
+            }
         }
         for (auto& t : later) t.join();
         if (stop) {
@@ -4349,6 +4784,22 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     pf_->ms += ms;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pf_->tokens += n;
+    if (pf_->stages && n > 0 && nc > 0) {
+        // the prompt's own line (the chunk lines above are the detail; this is the one a report carries): what its
+        // chunks walled per part and what the hand-overs between them cost
+        std::string per_part;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            if (!per_part.empty()) per_part += ", ";
+            per_part += "CUDA" + std::to_string(m->dev_) + " " +
+                        std::to_string((long long) std::llround(m->pf_->pr_wall)) + " ms";
+            if (m->pf_->pr_hop > 0.5)
+                per_part += " (hop in " + std::to_string((long long) std::llround(m->pf_->pr_hop)) + " ms)";
+        }
+        std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms (%.2f ms/token, %.0f tok/s), %d chunk%s of %d "
+                             "tokens | %s\n",
+                     (long long) n, ms, ms / (double) n, 1000.0 * (double) n / ms, nc, nc == 1 ? "" : "s", Tc,
+                     per_part.c_str());
+    }
     static const bool verbose = getenv("STRATA_GLM_PREFILL_VERBOSE") != nullptr;
     if (verbose) {
         uint64_t sr = 0, sv = 0, sd = 0, rr = 0, rs = 0, ce = 0, cr = 0, pi = 0, ph = 0, pr = 0;
@@ -4388,6 +4839,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                                  "(cumulative)\n", (unsigned long long) xe, (unsigned long long) xr, sh.c_str());
         }
     }
+    if (gaps_run > 0)
+        std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms with %llu decode gaps (%.1f ms of them, %.0f%%)\n",
+                     (long long) n, ms, (unsigned long long) gaps_run, gaps_ms, 100.0 * gaps_ms / std::max(1.0, ms));
     return true;
 }
 

@@ -272,11 +272,10 @@ const TIER_SETS = {
     {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
   ],
-  ds4: [
-    {key: "cpu", label: "On the CPU", icon: "cpu", unit: "/tok", digits: 1, tone: "info",
+  ds4: [   // (GLM's three - the CPU lane computes the experts that are not in VRAM - and the n-gram memory)
+    {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info",
      sub: "experts the CPU computed from RAM"},
-    {key: "disk_mb", label: "Disk reads", icon: "disk", unit: " MB/tok", digits: 1, tone: "warn",
-     sub: "read from the SSD a token"},
+    {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
     {key: "engram_ms", label: "N-gram memory", icon: "layers", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
   ],
@@ -312,30 +311,21 @@ function renderTiers(t, eng) {
     $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
     let sub = m.sub;
     if (m.key === "engram_ms" && eng && eng.engram_lookups) sub = `${fmt(+eng.engram_lookups)} n-gram lookups a token`;
-    if (m.key === "disk_mb" && v == null) sub = "not measured on this system";
-    if (m.key === "cpu" && n.ram != null) sub = `${fmt(n.ram, 1)} of them from RAM, the rest from the SSD`;
+    if ((m.key === "disk" || m.key === "ram_fetch") && v == null && ds4) sub = "not measured on this system";
     $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + sub;
     spark(`tp-${m.key}`, (h[m.key] || []).map((x) => (x == null ? 0 : x)), m.max);
   }
-  let vu, ru, disk, total;
-  const ds4Tier = ds4 && (+eng.ram_experts || 0) > 0;
-  if (ds4) {   // DeepSeek: the VRAM slots, the RAM tier's (when on), and the rest read in place from the model's files
-    vu = +eng.expert_slots || 0;
-    ru = ds4Tier ? +eng.ram_experts : +eng.cpu_experts || 0;
-    disk = ds4Tier ? Math.max(0, (+eng.cpu_experts || 0) - ru) : 0;
-    total = Math.max(1, vu + ru + disk);
-  } else {
-    vu = n.vram_used || 0; ru = n.ram_used || 0;
-    total = (eng && eng.experts) || Math.max(1, vu + ru);
-    disk = Math.max(0, total - vu - ru);
-  }
+  // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
+  const vu = n.vram_used || 0, ru = n.ram_used || 0;
+  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng && eng.experts) || Math.max(1, vu + ru);
+  const disk = Math.max(0, total - vu - ru);
   $("tierbar-vram").style.width = `${(100 * vu) / total}%`;
   $("tierbar-ram").style.width = `${(100 * ru) / total}%`;
   $("tierbar-disk").style.width = `${(100 * disk) / total}%`;
-  $("tier-ram-label").textContent = ds4 && !ds4Tier ? "RAM cache / SSD (in place)" : "Pinned RAM";
-  $("tier-disk-item").hidden = ds4 && !ds4Tier;
-  $("tier-vram-text").textContent = ds4 ? `${fmt(vu)} experts` : `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
-  $("tier-ram-text").textContent = ds4 ? `${fmt(ru)} experts` : `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
+  $("tier-ram-label").textContent = ds4 ? "RAM" : "Pinned RAM";
+  $("tier-disk-item").hidden = false;
+  $("tier-vram-text").textContent = `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
+  $("tier-ram-text").textContent = `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
   $("tier-disk-text").textContent = `${fmt(disk)} experts`;
   $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
                                                         : `live · ${fmt(total)} routed experts`;
@@ -362,6 +352,7 @@ function renderTiers(t, eng) {
 // one GPU: its row, opened (the hardware cards have its readings)
 const GPU_PARTS = [
   {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
+  {key: "prompt", label: "Prompt buffers"}, {key: "tp", label: "Tensor parallel"},
   {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
   {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
 ];
@@ -407,11 +398,15 @@ function gpuDetail(g, segs, m) {
                          : `${ctxfmt(ctx)} positions`) + (inUse ? ` · ${kfmt(inUse)} in use` : "") +
         (g.kv_ram ? ` · ${gb(g.kv_ram)} GB pinned in RAM` : ""),
     act: "one token's working buffers",
+    prompt: "a long prompt's chunks: their working buffers and the ring the CPU lane's experts stream through",
+    tp: g.tp_n > 1 ? `the copies a group of ${g.tp_n} GPUs needs: the tensors each of them holds whole, and its layers' KV cache`
+                   : "",
     drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""]
       .filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
       .filter(Boolean).join(" · "),
-    vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
+    vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process"
+                                                                                : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
     free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",
@@ -2193,6 +2188,78 @@ async function watchReload(to) {
   }
 }
 
+// ------------------------------------------------------------------ the port (Maya starts again on it)
+let portInfo = null;                  // GET /api/port: {port, host, restarts, saved, restarting}
+async function loadPortInfo() {
+  try {
+    const r = await fetch("api/port", {headers: headers()});
+    portInfo = r.ok ? await r.json() : null;
+  } catch (e) { portInfo = null; }
+  return portInfo;
+}
+function portValue() {
+  const v = $("s-port").value.trim();
+  return /^\d+$/.test(v) ? +v : null;
+}
+function renderPortField() {
+  $("port-field").hidden = !(portInfo && portInfo.port && portInfo.saved);
+  if ($("port-field").hidden) return;
+  $("s-port").value = String(portInfo.port);
+  outputsPort();
+}
+function outputsPort() {
+  if (!portInfo) return;
+  const v = portValue(), now = portInfo.port;
+  $("o-port").textContent = v === now ? `${now} · now` : (v ? String(v) : "");
+  const warns = [];
+  if (v !== null && v !== now) {
+    if (v < 1024 || v > 65535) warns.push("Use a number from 1024 to 65535.");
+    else warns.push(portInfo.restarts ? "Saving starts Maya again on this port (about 1-3 minutes); this page follows it."
+                                      : "Saved for the next start: this server was not started by Maya's start script, so it stays on its port until then.");
+    warns.push("Apps that use the API need the new address too.");
+  }
+  $("port-warn").hidden = !warns.length;
+  $("port-warn").textContent = warns.join(" ");
+}
+$("s-port").oninput = outputsPort;
+async function confirmPort(n) {
+  const now = portInfo.port, url = `${location.protocol}//${location.hostname}:${n}${location.pathname}`;
+  const ok = await confirmDialog(`Move Maya to port ${n}?`,
+    `<p>Maya listens on port <b>${esc(String(now))}</b> now. ` + (portInfo.restarts
+      ? "Saving starts it again on the new port: the model loads again, about 1-3 minutes.</p>" +
+        "<ul><li>This page moves to <b>" + esc(url) + "</b> when Maya is back.</li>" +
+        "<li>Apps that use the API need the new port.</li>" + (busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"
+      : "The new port is saved and applies from the next start.</p>"), `Use port ${n}`);
+  if (!ok) return false;
+  try {
+    const r = await fetch("api/port", {method: "POST", headers: headers(true), body: JSON.stringify({port: n})});
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { msg = (await r.json()).error.message || msg; } catch (err) { /* not json */ }
+      throw new Error(msg);
+    }
+    const out = await r.json();
+    if (!out.restarts) { toast("success", "Port saved", `Maya uses port ${n} from its next start.`, 6000); return true; }
+  } catch (err) {
+    toast("error", "The port did not change", err.message, 6000);
+    return false;
+  }
+  setHint(`Moving Maya to port ${n}…`);
+  toast("info", "Starting again", `Maya moves to port ${n}; this page follows when it is back.`, 8000);
+  // the new address answers once Maya is back (no-cors: another port is another origin; an answer at all is enough)
+  for (let i = 0; i < 300; i++) {
+    await new Promise((res) => setTimeout(res, 2000));
+    try {
+      await fetch(`${location.protocol}//${location.hostname}:${n}/health`, {mode: "no-cors", cache: "no-store"});
+      location.href = url;
+      return true;
+    } catch (e) { /* not up yet */ }
+  }
+  setHint("");
+  toast("error", "Maya is not back yet", `Open ${url} when it is.`, 30000);
+  return true;
+}
+
 // ------------------------------------------------------------------ the settings drawer
 let drawerReturn = null, drawerSnapshot = null;
 function formState() {
@@ -2201,7 +2268,8 @@ function formState() {
           top_k: +$("s-topk").value, min_p: +$("s-minp").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
           show: $("s-show").getAttribute("aria-checked") === "true", mcp: $("s-mcp").getAttribute("aria-checked") === "true",
           share: $("s-share").getAttribute("aria-checked") === "true", system: $("s-system").value,
-          sys_default: $("s-sys-default").getAttribute("aria-checked") === "true", ctx: ctxInfo ? ctxValue() : null};
+          sys_default: $("s-sys-default").getAttribute("aria-checked") === "true", ctx: ctxInfo ? ctxValue() : null,
+          port: portInfo && !$("port-field").hidden ? portValue() : null};
 }
 async function openDrawer() {
   drawerReturn = document.activeElement;
@@ -2210,8 +2278,9 @@ async function openDrawer() {
   $("scrim").hidden = false;
   $("dirty-bar").hidden = true;
   loadDrawer();
-  await Promise.all([loadShared(), loadMcp(), loadCtxInfo()]);
+  await Promise.all([loadShared(), loadMcp(), loadCtxInfo(), loadPortInfo()]);
   renderCtxField();
+  renderPortField();
   loadDrawer();
   drawerSnapshot = JSON.stringify(formState());
   $("drawer-close").focus();
@@ -2327,7 +2396,7 @@ for (const id of ["s-temp", "s-topp", "s-topk", "s-minp"]) $(id).oninput = outpu
 for (const id of ["s-show", "s-mcp", "s-share", "s-sys-default"]) {
   $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
 }
-$("s-reset").onclick = () => { loadDrawer({...DEFAULTS, system: current.system}); renderCtxField(); };
+$("s-reset").onclick = () => { loadDrawer({...DEFAULTS, system: current.system}); renderCtxField(); renderPortField(); };
 async function applySettings() {
   const f = formState();
   settings = {thinking: f.thinking, temperature: f.temperature, top_p: f.top_p, top_k: f.top_k, min_p: f.min_p, max: f.max,
@@ -2349,6 +2418,10 @@ async function applySettings() {
   }
   if (note !== null) toast("success", "Settings saved", note);
   if (ctxInfo && f.ctx && f.ctx !== ctxInfo.context) await confirmContext(f.ctx);
+  if (portInfo && f.port && f.port !== portInfo.port) {
+    if (f.port < 1024 || f.port > 65535) toast("error", "The port did not change", "Use a number from 1024 to 65535.", 6000);
+    else await confirmPort(f.port);
+  }
 }
 $("s-apply").onclick = applySettings;
 $("dirty-save").onclick = applySettings;
